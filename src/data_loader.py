@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
@@ -17,6 +18,8 @@ def load_features(
     db_path: Path = DB_PATH,
     limit: Optional[int] = None,
     where: str = "",
+    max_rows: Optional[int] = None,
+    float32: bool = False,
 ) -> pd.DataFrame:
     """Load the features table from SQLite and return a clean DataFrame.
 
@@ -30,6 +33,16 @@ def load_features(
     where : str
         Optional SQL WHERE clause fragment (omit the ``WHERE`` keyword),
         e.g. ``"pickup_hour BETWEEN 8 AND 10"``.
+    max_rows : int, optional
+        If given and the table has more rows, a systematic sample of roughly
+        this size is taken in SQL (``rowid % k = 0``), so the full table never
+        has to be materialised in pandas.  Unlike ``limit``, which returns the
+        first N rows in insertion order, the sample is spread across the whole
+        table.  Deterministic across runs.
+    float32 : bool
+        If True, downcast float64 columns to float32 after loading, halving
+        the in-memory footprint.  Fare precision (cents) is far above float32
+        resolution, so model quality is unaffected.
 
     Returns
     -------
@@ -40,18 +53,33 @@ def load_features(
     select_cols = ", ".join([TARGET_COL] + FEATURE_COLS + CATEGORICAL_COLS)
     query = f"SELECT {select_cols} FROM features"
 
-    if where:
-        query += f" WHERE {where}"
-    if limit is not None:
-        query += f" LIMIT {limit}"
+    conditions = [where] if where else []
 
     con = sqlite3.connect(db_path)
     try:
+        if max_rows is not None:
+            total = con.execute("SELECT COUNT(*) FROM features").fetchone()[0]
+            if total > max_rows:
+                # Ceiling division: a floor stride would select more than
+                # max_rows rows whenever max_rows does not divide total.
+                stride = -(-total // max_rows)
+                conditions.append(f"(rowid % {stride}) = 0")
+
+        if conditions:
+            query += " WHERE " + " AND ".join(f"({c})" for c in conditions)
+        if limit is not None:
+            query += f" LIMIT {limit}"
+
         df = pd.read_sql_query(query, con)
     finally:
         con.close()
 
     df = df.dropna(subset=FEATURE_COLS + CATEGORICAL_COLS)
+
+    if float32:
+        float_cols = df.select_dtypes(include=["float64"]).columns
+        df[float_cols] = df[float_cols].astype(np.float32)
+
     return df
 
 
@@ -73,32 +101,41 @@ def _populate_db(db_path: Path, sql_dir: Path, raw_dir: Path) -> None:
 
     # Column mapping: TLC parquet source names → our trips schema
     _COL_MAP: dict[str, str] = {
-        "VendorID":               "vendor_id",
-        "vendor_id":              "vendor_id",
-        "tpep_pickup_datetime":   "pickup_datetime",
-        "tpep_dropoff_datetime":  "dropoff_datetime",
-        "passenger_count":        "passenger_count",
-        "trip_distance":          "trip_distance",
-        "pickup_longitude":       "pickup_longitude",
-        "pickup_latitude":        "pickup_latitude",
-        "dropoff_longitude":      "dropoff_longitude",
-        "dropoff_latitude":       "dropoff_latitude",
-        "PULocationID":           "pickup_zone_id",
-        "DOLocationID":           "dropoff_zone_id",
-        "pickup_zone_id":         "pickup_zone_id",
-        "dropoff_zone_id":        "dropoff_zone_id",
-        "fare_amount":            "fare_amount",
-        "tip_amount":             "tip_amount",
-        "total_amount":           "total_amount",
-        "payment_type":           "payment_type",
+        "VendorID": "vendor_id",
+        "vendor_id": "vendor_id",
+        "tpep_pickup_datetime": "pickup_datetime",
+        "tpep_dropoff_datetime": "dropoff_datetime",
+        "passenger_count": "passenger_count",
+        "trip_distance": "trip_distance",
+        "pickup_longitude": "pickup_longitude",
+        "pickup_latitude": "pickup_latitude",
+        "dropoff_longitude": "dropoff_longitude",
+        "dropoff_latitude": "dropoff_latitude",
+        "PULocationID": "pickup_zone_id",
+        "DOLocationID": "dropoff_zone_id",
+        "pickup_zone_id": "pickup_zone_id",
+        "dropoff_zone_id": "dropoff_zone_id",
+        "fare_amount": "fare_amount",
+        "tip_amount": "tip_amount",
+        "total_amount": "total_amount",
+        "payment_type": "payment_type",
     }
     _TRIPS_COLS = [
-        "vendor_id", "pickup_datetime", "dropoff_datetime",
-        "passenger_count", "trip_distance",
-        "pickup_longitude", "pickup_latitude",
-        "dropoff_longitude", "dropoff_latitude",
-        "pickup_zone_id", "dropoff_zone_id",
-        "fare_amount", "tip_amount", "total_amount", "payment_type",
+        "vendor_id",
+        "pickup_datetime",
+        "dropoff_datetime",
+        "passenger_count",
+        "trip_distance",
+        "pickup_longitude",
+        "pickup_latitude",
+        "dropoff_longitude",
+        "dropoff_latitude",
+        "pickup_zone_id",
+        "dropoff_zone_id",
+        "fare_amount",
+        "tip_amount",
+        "total_amount",
+        "payment_type",
     ]
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,8 +166,14 @@ def _populate_db(db_path: Path, sql_dir: Path, raw_dir: Path) -> None:
         # method="multi" packs chunksize * n_cols of them into one INSERT, so the
         # chunksize must shrink as the column count grows to stay under the limit.
         safe_chunksize = max(1, 999 // len(df.columns))
-        df.to_sql("trips", con, if_exists="append", index=False,
-                  method="multi", chunksize=safe_chunksize)
+        df.to_sql(
+            "trips",
+            con,
+            if_exists="append",
+            index=False,
+            method="multi",
+            chunksize=safe_chunksize,
+        )
         total += len(df)
         print(f" {len(df):,} rows")
 
@@ -152,11 +195,13 @@ def get_train_test_split(
     db_path: Path = DB_PATH,
     test_size: float = 0.2,
     random_state: int = 42,
+    limit: Optional[int] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     """Return X_train, X_test, y_train, y_test from the features table.
 
-    Loads the full features table, extracts the model-ready feature matrix via
-    ``build_feature_matrix``, then performs a random stratification-free split.
+    Loads the features table (optionally sampled), extracts the model-ready
+    feature matrix via ``build_feature_matrix``, then performs a random
+    stratification-free split.
 
     Parameters
     ----------
@@ -166,6 +211,11 @@ def get_train_test_split(
         Fraction of rows reserved for the held-out test set.
     random_state : int
         Seed for the split RNG, ensuring reproducibility across runs.
+    max_rows : int, optional
+        Systematic-sample row cap forwarded to ``load_features``; used by the
+        ``lite`` training profile to keep memory bounded on low-end hardware.
+    float32 : bool
+        Downcast float columns to float32 (see ``load_features``).
 
     Returns
     -------
@@ -174,7 +224,7 @@ def get_train_test_split(
     y_train, y_test : pd.Series
         Target vectors aligned with the corresponding feature matrices.
     """
-    df = load_features(db_path=db_path)
+    df = load_features(db_path=db_path, limit=limit)
     X, y = build_feature_matrix(df)
 
     X_train, X_test, y_train, y_test = train_test_split(

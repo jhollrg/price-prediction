@@ -19,7 +19,7 @@ endif
 # (e.g. `from config import ...` inside src/train.py).
 export PYTHONPATH := src
 
-.PHONY: setup data db train test clean lint
+.PHONY: setup data db train train-lite test clean lint
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -35,6 +35,9 @@ db:
 
 train:
 	$(VENV_PYTHON) -m src.train
+
+train-lite:
+	$(VENV_PYTHON) -m src.train --profile lite
 
 test:
 	$(VENV_PYTEST) tests/ -v --tb=short
